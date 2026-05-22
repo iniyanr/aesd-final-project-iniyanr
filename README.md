@@ -1,5 +1,7 @@
 # SecWrapFS: Secure, Time-Audited Stackable Virtual File System
 
+![SecWrapFS](images/SecWrapFS.png)
+
 ## Table of Contents
 1. [Project Overview](#project-overview)
 2. [Building SecWrapFS](#bulilding-the-secwrapfs)
