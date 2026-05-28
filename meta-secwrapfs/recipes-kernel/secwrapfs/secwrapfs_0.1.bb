@@ -2,11 +2,12 @@ SUMMARY = "Recipe for out-of-tree SecWrapFS kernel module"
 SECTION = "kernel"
 LICENSE = "GPL-2.0-only"
 LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/GPL-2.0-only;md5=801f80980d171dd6425610833a22dbe6"
-
+PV = "2.0"
 inherit module
 
 SRC_URI = "file://secwrapfs.c \
-           file://Makefile \
+           file://secwrapfs_ioctl.h \ 
+	   file://Makefile \
           "
 
 S = "${WORKDIR}"
