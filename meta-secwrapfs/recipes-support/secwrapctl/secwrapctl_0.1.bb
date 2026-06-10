@@ -1,16 +1,21 @@
-SUMMARY = "User-space control utility for SecWrapFS"
-LICENSE = "GPL-2.0-only"
-LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/GPL-2.0-only;md5=801f80980d171dd6425610833a22dbe6"
+SUMMARY = "SecWrapFS IPC Command Line Utility"
+LICENSE = "MIT"
+LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/MIT;md5=0835ade698e0bcf8506ecda2f7b4f302"
 
-SRC_URI = "file://secwrapctl.c"
+DEPENDS += "systemd"
+
+SRC_URI = " \
+    file://secwrapctl.c \
+    file://secwrapfs_ioctl.h \
+"
 
 S = "${WORKDIR}"
 
 do_compile() {
-    ${CC} ${CFLAGS} ${LDFLAGS} secwrapctl.c -o secwrapctl
+    ${CC} ${CFLAGS} ${LDFLAGS} secwrapctl.c -o secwrapctl -lsystemd
 }
 
 do_install() {
     install -d ${D}${bindir}
-    install -m 0755 secwrapctl ${D}${bindir}
+    install -m 0755 secwrapctl ${D}${bindir}/
 }

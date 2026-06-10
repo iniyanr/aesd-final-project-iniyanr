@@ -7,14 +7,17 @@
 #include <linux/slab.h>
 #include <linux/file.h>
 #include <linux/mutex.h>
+#include <linux/ktime.h>
+#include <linux/time64.h>
 #include "secwrapfs_ioctl.h"
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("IniyanR");
-MODULE_DESCRIPTION("SecWrapFS Stackable Pass-Through Filesystem with IOCTL Concurrency");
-MODULE_VERSION("2.0");
+MODULE_DESCRIPTION("SecWrapFS Inline Cryptographic Stacking Filesystem with Precision Telemetry");
+MODULE_VERSION("3.0");
 
 #define SECWRAPFS_MAGIC_NUMBER 0x53574653
+#define SECWRAPFS_CRYPT_KEY    0xAA  /* Standard Cryptographic XOR Static Key Mask */
 
 static const struct super_operations secwrapfs_s_ops;
 static const struct inode_operations secwrapfs_dir_i_ops;
@@ -22,6 +25,7 @@ static const struct inode_operations secwrapfs_main_i_ops;
 static const struct file_operations secwrapfs_dir_f_ops;
 static const struct file_operations secwrapfs_main_f_ops;
 
+/* Concurrency & Telemetry Controls */
 static DEFINE_MUTEX(telemetry_lock);
 static struct secwrapfs_telemetry global_telemetry = {
     .total_reads = 0,
@@ -39,6 +43,15 @@ static inline struct path *SECWRAPFS_SB_PATH(struct super_block *sb) {
 
 static inline struct dentry *SECWRAPFS_D_LOWER(struct dentry *dentry) {
     return (struct dentry *)dentry->d_fsdata;
+}
+
+/* Internal Cryptographic Helper Routine */
+static void secwrapfs_crypt_buffer(char *buf, size_t len, unsigned long inode_num) {
+    size_t i;
+    for (i = 0; i < len; i++) {
+        /* Encrypt/Decrypt dynamically using a mask combined with the file's unique inode index */
+        buf[i] ^= (SECWRAPFS_CRYPT_KEY ^ (char)(inode_num & 0xFF));
+    }
 }
 
 static struct inode *secwrapfs_get_inode(struct super_block *sb, struct inode *lower_inode)
@@ -68,7 +81,9 @@ static struct inode *secwrapfs_get_inode(struct super_block *sb, struct inode *l
     return inode;
 }
 
-
+/* -------------------------------------------------------------------------
+ * Inode / Directory Creation & Lookup Interceptors
+ * ------------------------------------------------------------------------- */
 static int secwrapfs_create(struct mnt_idmap *idmap, struct inode *dir,
                             struct dentry *dentry, umode_t mode, bool want_excl)
 {
@@ -84,9 +99,8 @@ static int secwrapfs_create(struct mnt_idmap *idmap, struct inode *dir,
     inode_lock(lower_dir_inode);
     lower_dentry = lookup_one_len(dentry->d_name.name, lower_dir_dentry, dentry->d_name.len);
     if (IS_ERR(lower_dentry)) {
-        err = PTR_ERR(lower_dentry);
         inode_unlock(lower_dir_inode);
-        return err;
+        return PTR_ERR(lower_dentry);
     }
 
     err = vfs_create(idmap, lower_dir_inode, lower_dentry, mode, want_excl);
@@ -112,7 +126,6 @@ static int secwrapfs_create(struct mnt_idmap *idmap, struct inode *dir,
 
     return 0;
 }
-
 
 static struct dentry *secwrapfs_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags)
 {
@@ -141,35 +154,96 @@ static struct dentry *secwrapfs_lookup(struct inode *dir, struct dentry *dentry,
     return d_splice_alias(inode, dentry);
 }
 
-static const struct inode_operations secwrapfs_dir_i_ops = { .lookup = secwrapfs_lookup, .create = secwrapfs_create, };
+static const struct inode_operations secwrapfs_dir_i_ops = {
+    .lookup = secwrapfs_lookup,
+    .create = secwrapfs_create,
+};
 static const struct inode_operations secwrapfs_main_i_ops = {};
 
+/* -------------------------------------------------------------------------
+ * File Stream Cryptographic Hook Interceptors & Timestamp Recording
+ * ------------------------------------------------------------------------- */
 static ssize_t secwrapfs_read(struct file *file, char __user *buf, size_t count, loff_t *pos)
 {
     struct file *lower_file = file->private_data;
-    
+    struct inode *inode = file_inode(file);
+    char *kernel_buf;
+    ssize_t bytes_read;
+    struct timespec64 ts;
+
+    /* Capture high-fidelity transaction timestamp metrics */
+    ktime_get_real_ts64(&ts);
+
     mutex_lock(&telemetry_lock);
     global_telemetry.total_reads++;
+    global_telemetry.last_tx.inode_num = (uint64_t)inode->i_ino;
+    snprintf(global_telemetry.last_tx.operation_type, sizeof(global_telemetry.last_tx.operation_type), "READ");
+    global_telemetry.last_tx.tv_sec = (int64_t)ts.tv_sec;
+    global_telemetry.last_tx.tv_nsec = (int64_t)ts.tv_nsec;
+    global_telemetry.last_tx.byte_count = (uint64_t)count;
     mutex_unlock(&telemetry_lock);
 
     if (global_telemetry.log_verbosity)
-        printk(KERN_INFO "SecWrapFS: Intercepted VFS read event logged safely.\n");
+        printk(KERN_INFO "SecWrapFS: Inline decrypt hook processing stream read.\n");
 
-    return vfs_read(lower_file, buf, count, pos);
+    kernel_buf = kmalloc(count, GFP_KERNEL);
+    if (!kernel_buf)
+        return -ENOMEM;
+
+    bytes_read = kernel_read(lower_file, kernel_buf, count, pos);
+    if (bytes_read > 0) {
+        /* Inline Decryption Transformation */
+        secwrapfs_crypt_buffer(kernel_buf, bytes_read, inode->i_ino);
+        
+        if (copy_to_user(buf, kernel_buf, bytes_read)) {
+            kfree(kernel_buf);
+            return -EFAULT;
+        }
+    }
+
+    kfree(kernel_buf);
+    return bytes_read;
 }
 
 static ssize_t secwrapfs_write(struct file *file, const char __user *buf, size_t count, loff_t *pos)
 {
     struct file *lower_file = file->private_data;
+    struct inode *inode = file_inode(file);
+    char *kernel_buf;
+    ssize_t bytes_written;
+    struct timespec64 ts;
+
+    /* Capture high-fidelity transaction timestamp metrics */
+    ktime_get_real_ts64(&ts);
 
     mutex_lock(&telemetry_lock);
     global_telemetry.total_writes++;
+    global_telemetry.last_tx.inode_num = (uint64_t)inode->i_ino;
+    snprintf(global_telemetry.last_tx.operation_type, sizeof(global_telemetry.last_tx.operation_type), "WRITE");
+    global_telemetry.last_tx.tv_sec = (int64_t)ts.tv_sec;
+    global_telemetry.last_tx.tv_nsec = (int64_t)ts.tv_nsec;
+    global_telemetry.last_tx.byte_count = (uint64_t)count;
     mutex_unlock(&telemetry_lock);
 
     if (global_telemetry.log_verbosity)
-        printk(KERN_INFO "SecWrapFS: Intercepted VFS write event logged safely.\n");
+        printk(KERN_INFO "SecWrapFS: Inline encrypt hook processing stream write.\n");
 
-    return vfs_write(lower_file, buf, count, pos);
+    kernel_buf = kmalloc(count, GFP_KERNEL);
+    if (!kernel_buf)
+        return -ENOMEM;
+
+    if (copy_from_user(kernel_buf, buf, count)) {
+        kfree(kernel_buf);
+        return -EFAULT;
+    }
+
+    /* Inline Encryption Transformation prior to backing disk commitment */
+    secwrapfs_crypt_buffer(kernel_buf, count, inode->i_ino);
+
+    bytes_written = kernel_write(lower_file, kernel_buf, count, pos);
+
+    kfree(kernel_buf);
+    return bytes_written;
 }
 
 static int secwrapfs_open(struct inode *inode, struct file *file)
@@ -210,12 +284,11 @@ static long secwrapfs_unlocked_ioctl(struct file *file, unsigned int cmd, unsign
         mutex_lock(&telemetry_lock);
         global_telemetry.log_verbosity = verbosity_val;
         mutex_unlock(&telemetry_lock);
-        
-        printk(KERN_INFO "SecWrapFS: Logging status modified runtime via IOCTL to %u\n", verbosity_val);
         break;
 
     case SECWRAPFS_GET_TELEMETRY:
         mutex_lock(&telemetry_lock);
+        /* Safe architectural block structure transmission */
         if (copy_to_user((struct secwrapfs_telemetry __user *)arg, &global_telemetry, sizeof(global_telemetry))) {
             mutex_unlock(&telemetry_lock);
             return -EFAULT;
@@ -226,7 +299,6 @@ static long secwrapfs_unlocked_ioctl(struct file *file, unsigned int cmd, unsign
     default:
         return -ENOTTY;
     }
-
     return 0;
 }
 
@@ -257,16 +329,19 @@ static const struct file_operations secwrapfs_main_f_ops = {
     .release        = secwrapfs_release,
     .read           = secwrapfs_read,
     .write          = secwrapfs_write,
-    .unlocked_ioctl = secwrapfs_unlocked_ioctl, 
+    .unlocked_ioctl = secwrapfs_unlocked_ioctl,
 };
 
 static const struct file_operations secwrapfs_dir_f_ops = {
     .open           = secwrapfs_open,
     .release        = secwrapfs_release,
     .iterate_shared = secwrapfs_iterate,
-    .unlocked_ioctl = secwrapfs_unlocked_ioctl, 
+    .unlocked_ioctl = secwrapfs_unlocked_ioctl,
 };
 
+/* -------------------------------------------------------------------------
+ * Superblock Registry Layout
+ * ------------------------------------------------------------------------- */
 static void secwrapfs_put_super(struct super_block *sb)
 {
     struct secwrapfs_sb_info *sbi = sb->s_fs_info;
